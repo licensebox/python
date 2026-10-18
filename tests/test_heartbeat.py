@@ -190,3 +190,59 @@ class MonitorTests(unittest.TestCase):
             finally:
                 release.set()
                 self.assertTrue(client._pending_exchange.wait(0.5))
+
+    def test_offline_deadline_is_monotonic_despite_clock_rollback(self):
+        initial = result()
+        client = self.fake(initial, lambda: dict(initial, online=False))
+        monitor = HeartbeatMonitor(client,"core",interval=0.01)
+        try:
+            before = monitor._deadline
+            client.clock = client._now = lambda: time.time() - 3600
+            self.assertTrue(monitor.stopped.wait(0.6))
+            self.assertEqual(monitor.error.code,"expired")
+            self.assertEqual(monitor._deadline,before)
+            self.assertGreater(client.heartbeat.call_count,1)
+        finally:
+            monitor.close()
+
+    def test_late_online_result_cannot_bridge_expiry_when_watchdog_is_delayed(self):
+        release = threading.Event()
+        class DelayedWatchdog(HeartbeatMonitor):
+            def _watch(self):
+                release.wait(1)
+                super()._watch()
+        initial = result(0.1)
+        def late():
+            time.sleep(0.15)
+            return result(60)
+        client = self.fake(initial,late)
+        monitor = DelayedWatchdog(client,"core",interval=0.01)
+        try:
+            self.assertTrue(monitor.stopped.wait(0.6))
+            self.assertEqual(monitor.error.code,"expired")
+            self.assertEqual(monitor.latest["lease"]["expires"],initial["lease"]["expires"])
+        finally:
+            release.set()
+            monitor.close()
+
+    def test_refusal_headers_remain_http_error_when_body_stalls_or_fails(self):
+        for stalled in (False,True):
+            with self.subTest(stalled=stalled), tempfile.TemporaryDirectory() as directory:
+                release = threading.Event()
+                class Refusal:
+                    code = 403
+                    def __enter__(self): return self
+                    def __exit__(self,*_): pass
+                    def read1(self,_):
+                        if stalled: release.wait(1)
+                        raise TimeoutError("synthetic body timeout")
+                client = Client("demo",{"test":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"},directory=directory)
+                client._http.open = Mock(return_value=Refusal())
+                try:
+                    with self.assertRaises(LicenseboxError) as caught:
+                        client._post("/v1/renew",{},timeout=0.02)
+                    self.assertEqual(caught.exception.code,"http_error")
+                    self.assertEqual(caught.exception.status,403)
+                finally:
+                    release.set()
+                    self.assertTrue(client._pending_exchange.wait(0.5))

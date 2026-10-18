@@ -5,7 +5,7 @@ access for desktop and command-line applications. Licensebox manages licensing;
 product admins handle grants and any commercial arrangements separately.
 
 ```sh
-python3 -m pip install 'git+https://github.com/licensebox/python.git@v0.1.0'
+python3 -m pip install 'git+https://github.com/licensebox/python.git@v0.2.0'
 ```
 
 ```python

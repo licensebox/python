@@ -319,6 +319,11 @@ class Client:
         done, abandon = threading.Event(), threading.Event()
         outcome: dict = {}
         deadline = time.monotonic() + timeout
+        def failure():
+            status = outcome.get("status", 0)
+            if 300 <= status < 500:
+                return LicenseboxError("http_error", f"HTTP {status}", status)
+            return LicenseboxError("network_error", "cannot reach the licensing server", status)
         def exchange():
             try:
                 try:
@@ -362,12 +367,12 @@ class Client:
                 raise LicenseboxError("cancelled")
             if time.monotonic() >= deadline:
                 abandon.set()
-                raise LicenseboxError("network_error", "cannot reach the licensing server", outcome.get("status", 0))
+                raise failure()
         if cancel is not None and cancel.is_set():
             abandon.set()
             raise LicenseboxError("cancelled")
         if "error" in outcome:
-            raise LicenseboxError("network_error", "cannot reach the licensing server", outcome.get("status", 0)) from outcome["error"]
+            raise failure() from outcome["error"]
         status, data = outcome["status"], outcome["data"]
         if len(data) > _LIMIT:
             raise LicenseboxError("protocol_error", "invalid server response", status)

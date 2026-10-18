@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import copy
 import hashlib
 import hmac
 import json
@@ -20,7 +21,8 @@ from datetime import datetime, timezone
 from typing import Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
+import ssl
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -178,6 +180,14 @@ def verify_lease(token: str, product: str, keys: Mapping[str, str], now: float, 
     if not isinstance(value.get("modules"), list) or any(not isinstance(item, str) for item in value["modules"]):
         raise LicenseboxError("malformed", "invalid module list")
     expires = _epoch(value.get("expires"))
+    heartbeat = value.get("heartbeat")
+    if heartbeat is not None:
+        if not isinstance(heartbeat, dict):
+            raise LicenseboxError("malformed", "invalid heartbeat policy")
+        interval, grace = heartbeat.get("interval_seconds"), heartbeat.get("grace_seconds")
+        if (type(interval) is not int or type(grace) is not int or not 30 <= interval <= 86400
+                or not interval <= grace <= 31536000 or expires > _epoch(value.get("issued")) + grace):
+            raise LicenseboxError("malformed", "invalid heartbeat policy or contact deadline")
     if now >= expires and not allow_expired:
         raise LicenseboxError("expired")
     return value
@@ -191,7 +201,8 @@ class _NoRedirect(HTTPRedirectHandler):
 class Client:
     def __init__(self, product: str, keys: Mapping[str, str], *, version: str = "", server: str = "https://licensebox.dev",
                  directory: str | Path | None = None, on_sign_in: Callable[[str, str], None] | None = None,
-                 machine_binding: Callable[[], str] | None = None, clock: Callable[[], float] = time.time):
+                 machine_binding: Callable[[], str] | None = None, clock: Callable[[], float] = time.time,
+                 ca_bundle: str | Path | None = None):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", product) or not keys:
             raise ValueError("a product ID and trusted public keys are required")
         for key in keys.values():
@@ -210,7 +221,7 @@ class Client:
         self._host: str | None = None
         self._checked: dict | None = None
         self._lock = threading.RLock()
-        self._http = build_opener(_NoRedirect())
+        self._http = build_opener(_NoRedirect(), HTTPSHandler(context=ssl.create_default_context(cafile=ca_bundle)))
 
     def _binding(self) -> str:
         if self._host is None:
@@ -274,8 +285,14 @@ class Client:
             return key
         raise LicenseboxError("io_error", "installation key is damaged or being written by another process")
 
-    def _own(self, value: dict) -> None:
-        if value.get("binding") != self._binding() or value.get("machine") != _enc(self._key().public_key().public_bytes_raw()):
+    def _existing_key(self) -> Ed25519PrivateKey:
+        seed = self._read("install.key")
+        if not seed:
+            raise LicenseboxError("not_signed_in", "the installation key is unavailable; explicitly sign in")
+        return Ed25519PrivateKey.from_private_bytes(_dec(seed, 32))
+
+    def _own(self, value: dict, key: Ed25519PrivateKey | None = None) -> None:
+        if value.get("binding") != self._binding() or value.get("machine") != _enc((key or self._key()).public_key().public_bytes_raw()):
             raise PolicyError("machine_changed", "these credentials belong to another machine; explicitly sign in to activate here")
 
     def _denial(self) -> None:
@@ -289,56 +306,96 @@ class Client:
                 raise LicenseboxError("io_error", "saved policy refusal is damaged; connect to renew") from error
             raise PolicyError(value["code"], value.get("detail", ""))
 
-    def _post(self, path: str, payload: dict, timeout: float = 20) -> dict | list:
+    def _post(self, path: str, payload: dict, timeout: float = 20,
+              cancel: threading.Event | None = None) -> dict | list:
         request = Request(self.server + path, json.dumps(payload, separators=(",", ":")).encode(), {"Content-Type": "application/json"})
-        try:
-            response = self._http.open(request, timeout=timeout)
-        except HTTPError as error:
+        # Only the network exchange runs in this bounded worker. Persistent state
+        # is handled on the calling thread, so a late response cannot change access.
+        done, abandon = threading.Event(), threading.Event()
+        outcome: dict = {}
+        deadline = time.monotonic() + timeout
+        def exchange():
             try:
-                value = json.loads(error.read(_LIMIT + 1))
-                code, detail = value.get("error", "http_error"), value.get("error_description", "")
-            except (ValueError, AttributeError):
-                code, detail = "http_error", f"HTTP {error.code}"
+                try:
+                    response = self._http.open(request, timeout=timeout)
+                except HTTPError as response_error:
+                    response = response_error
+                with response:
+                    outcome["status"] = response.code
+                    chunks, length = [], 0
+                    while length <= _LIMIT and not abandon.is_set():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError()
+                        # Bound each socket read by the remaining total budget.
+                        try:
+                            response.fp.raw._sock.settimeout(remaining)
+                        except AttributeError:
+                            pass
+                        chunk = response.read1(min(65536, _LIMIT + 1 - length))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        length += len(chunk)
+                    outcome["data"] = b"".join(chunks)
+            except BaseException as error:
+                outcome["error"] = error
+            finally:
+                done.set()
+        threading.Thread(target=exchange, name="licensebox-http", daemon=True).start()
+        while not done.wait(min(0.05, max(0, deadline - time.monotonic()))):
+            if cancel is not None and cancel.is_set():
+                abandon.set()
+                raise LicenseboxError("cancelled")
+            if time.monotonic() >= deadline:
+                abandon.set()
+                raise LicenseboxError("network_error", "cannot reach the licensing server", outcome.get("status", 0))
+        if cancel is not None and cancel.is_set():
+            abandon.set()
+            raise LicenseboxError("cancelled")
+        if "error" in outcome:
+            raise LicenseboxError("network_error", "cannot reach the licensing server", outcome.get("status", 0)) from outcome["error"]
+        status, data = outcome["status"], outcome["data"]
+        if len(data) > _LIMIT:
+            raise LicenseboxError("protocol_error", "invalid server response", status)
+        try:
+            value = json.loads(data)
+        except (ValueError, UnicodeError) as error:
+            raise LicenseboxError("protocol_error" if status == 200 else "http_error", f"HTTP {status}", status) from error
+        if status != 200:
+            code = value.get("error", "http_error") if isinstance(value, dict) else "http_error"
+            detail = value.get("error_description", "") if isinstance(value, dict) else ""
             if code in _POLICY:
                 self._write("policy-denial", json.dumps({"code": code, "detail": detail or code}))
-                raise PolicyError(code, detail, error.code) from error
+                raise PolicyError(code, detail, status)
             if code == "revoked":
                 self._forget()
-            raise LicenseboxError(code, detail, error.code) from error
-        except (URLError, TimeoutError, OSError) as error:
-            raise LicenseboxError("network_error", "cannot reach the licensing server") from error
-        with response:
-            data = response.read(_LIMIT + 1)
-            if len(data) > _LIMIT or response.status != 200:
-                raise LicenseboxError("protocol_error", "invalid server response", response.status)
-            try:
-                return json.loads(data)
-            except (ValueError, UnicodeError) as error:
-                raise LicenseboxError("protocol_error", "invalid server JSON") from error
+            raise LicenseboxError(code, detail, status)
+        return value
 
-    def _save(self, token: str) -> dict:
+    def _save(self, token: str, key: Ed25519PrivateKey | None = None) -> dict:
         value = verify_lease(token, self.product, self.keys, self._now())
-        self._own(value)
+        self._own(value, key)
         self._write("lease", token)
         self._remove("policy-denial")
         return value
 
-    def _call(self, kind: str, payload: dict, *, timeout: float = 20) -> dict | list:
+    def _call(self, kind: str, payload: dict, *, timeout: float = 20, key: Ed25519PrivateKey | None = None, cancel: threading.Event | None = None) -> dict | list:
         if kind not in _CALLS:
             raise ValueError("unknown signed operation")
         token = self._read("lease")
         value, _, _ = _parse(token)
-        self._own(value)
+        self._own(value, key)
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         at = _stamp(self.clock())
         message = f"licensebox {kind} v2\n{token}\n{self._binding()}\n{at}\n{hashlib.sha256(body.encode()).hexdigest()}"
         return self._post("/v1/" + kind, {"lease": token, "binding": self._binding(), "time": at,
-                          "payload": body, "version": self.version, "signature": _enc(self._key().sign(message.encode()))}, timeout)
+                          "payload": body, "version": self.version, "signature": _enc((key or self._key()).sign(message.encode()))}, timeout, cancel)
 
-    def _renew(self, timeout: float = 3) -> dict:
+    def _renew(self, timeout: float = 3, *, key: Ed25519PrivateKey | None = None, cancel: threading.Event | None = None) -> dict:
         sent = self._usage()[:100]
-        response = self._call("renew", {"usage": sent}, timeout=timeout)
-        value = self._save(response["lease"])
+        response = self._call("renew", {"usage": sent}, timeout=timeout, key=key, cancel=cancel)
+        value = self._save(response["lease"], key)
         self._usage_sent(sent, response.get("usage", False))
         return value
 
@@ -347,7 +404,7 @@ class Client:
             self._binding()
             now = self._now()
             if self._checked and now < _epoch(self._checked["expires"]) and not (self.directory / "policy-denial").exists():
-                return dict(self._checked)
+                return copy.deepcopy(self._checked)
             token = self._read("lease")
             if not token:
                 return self._sign_in(False)
@@ -358,7 +415,7 @@ class Client:
             self._own(kept)
             try:
                 self._checked = self._renew()
-                return dict(self._checked)
+                return copy.deepcopy(self._checked)
             except PolicyError:
                 raise
             except LicenseboxError as error:
@@ -386,7 +443,44 @@ class Client:
                         raise
             if module not in value["modules"]:
                 raise ModuleError(self.product, module, value.get("email", ""))
-            return value
+            return copy.deepcopy(value)
+
+    def heartbeat(self, module: str, *, cancel: threading.Event | None = None) -> dict:
+        """Force a silent contact; never activate or replace the installation key."""
+        if not isinstance(module, str) or not module:
+            raise LicenseboxError("invalid_argument", "a nonempty module is required")
+        with self._lock:
+            if cancel is not None and cancel.is_set():
+                raise LicenseboxError("cancelled")
+            token = self._read("lease")
+            if not token:
+                raise LicenseboxError("not_signed_in")
+            kept = verify_lease(token, self.product, self.keys, self._now(), allow_expired=True)
+            key = self._existing_key()
+            self._own(kept, key)
+            try:
+                value = self._renew(key=key, cancel=cancel)
+                online = True
+            except LicenseboxError as error:
+                if (isinstance(error, PolicyError) or error.code in {"revoked", "invalid_lease", "terms_changed"}
+                        or 300 <= error.status < 500):
+                    raise
+                if error.code != "network_error" and error.status < 500:
+                    raise
+                self._denial()
+                if self._now() >= _epoch(kept["expires"]):
+                    raise LicenseboxError("offline", "the offline lease expired; connect to the internet") from error
+                value, online = kept, False
+            self._checked = value
+            if module not in value["modules"]:
+                raise ModuleError(self.product, module, value.get("email", ""))
+            return {"lease": copy.deepcopy(value), "online": online}
+
+    def watch(self, module: str, *, interval: float | None = None,
+              cancel: threading.Event | None = None,
+              on_stop: Callable[[LicenseboxError | None], None] | None = None) -> HeartbeatMonitor:
+        """Explicitly start a monitor after the initial heartbeat succeeds."""
+        return HeartbeatMonitor(self, module, interval=interval, cancel=cancel, on_stop=on_stop)
 
     def status(self) -> dict:
         with self._lock:
@@ -527,3 +621,115 @@ class Client:
             item["ok" if ok else "failed"] += 1
             item["ms"] += int(elapsed_seconds * 1000)
             self._write("usage.json", json.dumps(queued[-1000:]))
+
+
+class HeartbeatMonitor:
+    """Opt-in heartbeat threads and an independent signed-expiry watchdog.
+
+    Protected work must observe ``stopped``. ``stop()`` signals immediately;
+    ``close()`` also waits up to 3.2 seconds for an in-flight check to finish.
+    Callbacks never run while holding the client lock and cannot prevent stopping.
+    """
+    def __init__(self, client: Client, module: str, *, interval: float | None = None,
+                 cancel: threading.Event | None = None,
+                 on_stop: Callable[[LicenseboxError | None], None] | None = None):
+        if interval is not None and (isinstance(interval, bool) or not isinstance(interval, (int, float))
+                                     or not 0 < interval < float("inf")):
+            raise ValueError("interval must be a positive number of seconds")
+        if cancel is not None and cancel.is_set():
+            raise LicenseboxError("cancelled")
+        first = client.heartbeat(module, cancel=cancel)
+        if cancel is not None and cancel.is_set():
+            raise LicenseboxError("cancelled")
+        self.stopped = threading.Event()
+        self.error: LicenseboxError | None = None
+        self._client, self._module = client, module
+        self._interval, self._cancel, self._on_stop = interval, cancel, on_stop
+        self._guard = threading.Lock()
+        self._latest = first
+        self._expires = _epoch(first["lease"]["expires"])
+        self._deadline = time.monotonic() + max(0, self._expires - client._now())
+        self._worker = threading.Thread(target=self._run, name="licensebox-heartbeat", daemon=True)
+        self._watchdog = threading.Thread(target=self._watch, name="licensebox-expiry", daemon=True)
+        self._watchdog.start()
+        self._worker.start()
+
+    @property
+    def latest(self) -> dict:
+        with self._guard:
+            return json.loads(json.dumps(self._latest))
+
+    def _expired(self) -> bool:
+        return time.monotonic() >= self._deadline
+
+    def _finish(self, error: LicenseboxError | None) -> None:
+        with self._guard:
+            if self.stopped.is_set():
+                return
+            self.error = error
+            self.stopped.set()
+        if self._on_stop:
+            def notify():
+                try:
+                    self._on_stop(error)
+                except BaseException:
+                    pass
+            threading.Thread(target=notify, name="licensebox-notify", daemon=True).start()
+
+    def stop(self) -> None:
+        """Cancel scheduling and notify consumer work immediately; idempotent."""
+        self._finish(None)
+
+    def close(self) -> None:
+        self.stop()
+        end = time.monotonic() + 3.2
+        for thread in (self._watchdog, self._worker):
+            if thread is not threading.current_thread():
+                thread.join(max(0, end - time.monotonic()))
+
+    def __enter__(self) -> HeartbeatMonitor:
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def _watch(self) -> None:
+        while not self.stopped.is_set():
+            if self._cancel is not None and self._cancel.is_set():
+                self._finish(LicenseboxError("cancelled"))
+                return
+            with self._guard:
+                expired = self._expired()
+                delay = min(0.05, max(0, self._deadline - time.monotonic()))
+            if expired:
+                self._finish(LicenseboxError("expired", "the signed heartbeat deadline expired"))
+                return
+            self.stopped.wait(delay)
+
+    def _run(self) -> None:
+        while not self.stopped.is_set():
+            with self._guard:
+                policy = self._latest["lease"].get("heartbeat") or {}
+                interval = min(self._interval or float("inf"), policy.get("interval_seconds", 300))
+            if self.stopped.wait(interval):
+                return
+            try:
+                result = self._client.heartbeat(self._module, cancel=self.stopped)
+                # Never hold the watchdog guard while invoking client/host code.
+                observed = self._client._now() if result["online"] else None
+                # A successful late renewal cannot bridge an authorization gap.
+                with self._guard:
+                    if self.stopped.is_set():
+                        return
+                    expired = self._expired()
+                    if not expired:
+                        self._latest = result
+                        if result["online"]:
+                            self._expires = _epoch(result["lease"]["expires"])
+                            self._deadline = time.monotonic() + max(0, self._expires - observed)
+                if expired:
+                    self._finish(LicenseboxError("expired", "the signed heartbeat deadline expired"))
+                    return
+            except BaseException as error:
+                self._finish(error if isinstance(error, LicenseboxError) else LicenseboxError("monitor_error", "heartbeat check failed"))
+                return

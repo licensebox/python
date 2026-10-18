@@ -14,7 +14,7 @@ try:
     elif operation == "native":
         result = native_binding(request["product"])
     else:
-        options = {key: request[key] for key in ("product", "keys", "server", "directory")}
+        options = {key: request[key] for key in ("product", "keys", "server", "directory", "ca_bundle") if key in request}
         if "binding" in request:
             options["machine_binding"] = lambda: request["binding"]
         options["clock"] = lambda: request["now"]
@@ -26,6 +26,13 @@ try:
             result = client.require(request.get("module", "core"))
         elif operation == "repeat":
             result = [client.require("core"), client.require("core")]
+        elif operation in {"heartbeat", "heartbeat-repeat", "heartbeat-after-require"}:
+            module = request.get("module", "core")
+            if operation == "heartbeat-after-require":
+                client.require(module)
+            if operation == "heartbeat-repeat":
+                client.heartbeat(module)
+            result = client.heartbeat(module)
         elif operation == "status":
             result = client.status()
         elif operation == "sign_in":

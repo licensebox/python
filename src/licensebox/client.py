@@ -221,6 +221,8 @@ class Client:
         self._host: str | None = None
         self._checked: dict | None = None
         self._lock = threading.RLock()
+        self._transport_lock = threading.Lock()
+        self._pending_exchange: threading.Event | None = None
         self._http = build_opener(_NoRedirect(), HTTPSHandler(context=ssl.create_default_context(cafile=ca_bundle)))
 
     def _binding(self) -> str:
@@ -289,7 +291,10 @@ class Client:
         seed = self._read("install.key")
         if not seed:
             raise LicenseboxError("not_signed_in", "the installation key is unavailable; explicitly sign in")
-        return Ed25519PrivateKey.from_private_bytes(_dec(seed, 32))
+        try:
+            return Ed25519PrivateKey.from_private_bytes(_dec(seed, 32))
+        except (LicenseboxError, ValueError) as error:
+            raise LicenseboxError("io_error", "the installation key is damaged; explicitly sign in") from error
 
     def _own(self, value: dict, key: Ed25519PrivateKey | None = None) -> None:
         if value.get("binding") != self._binding() or value.get("machine") != _enc((key or self._key()).public_key().public_bytes_raw()):
@@ -342,7 +347,15 @@ class Client:
                 outcome["error"] = error
             finally:
                 done.set()
-        threading.Thread(target=exchange, name="licensebox-http", daemon=True).start()
+        with self._transport_lock:
+            if self._pending_exchange is not None and not self._pending_exchange.is_set():
+                raise LicenseboxError("network_error", "the previous licensing connection is still closing")
+            self._pending_exchange = done
+            try:
+                threading.Thread(target=exchange, name="licensebox-http", daemon=True).start()
+            except BaseException:
+                done.set()
+                raise
         while not done.wait(min(0.05, max(0, deadline - time.monotonic()))):
             if cancel is not None and cancel.is_set():
                 abandon.set()
@@ -365,6 +378,8 @@ class Client:
         if status != 200:
             code = value.get("error", "http_error") if isinstance(value, dict) else "http_error"
             detail = value.get("error_description", "") if isinstance(value, dict) else ""
+            code = code if isinstance(code, str) else "http_error"
+            detail = detail if isinstance(detail, str) else ""
             if code in _POLICY:
                 self._write("policy-denial", json.dumps({"code": code, "detail": detail or code}))
                 raise PolicyError(code, detail, status)

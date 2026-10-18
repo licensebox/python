@@ -67,6 +67,8 @@ class MonitorTests(unittest.TestCase):
         initial = result()
         client = self.fake(initial, lambda: dict(initial, online=False))
         with HeartbeatMonitor(client, "core", interval=0.01) as monitor:
+            snapshot = monitor.latest
+            snapshot["lease"]["expires"] = "2099-01-01T00:00:00Z"
             self.assertTrue(monitor.stopped.wait(0.6))
             self.assertEqual(monitor.error.code, "expired")
             self.assertGreater(client.heartbeat.call_count, 1)
@@ -136,6 +138,11 @@ class MonitorTests(unittest.TestCase):
                 client.require("export")
             self.assertEqual(caught.exception.code,"module_denied")
             self.assertEqual(client.lease()["expires"],lease["expires"])
+            Path(directory,"install.key").write_text("damaged")
+            with self.assertRaises(LicenseboxError) as caught:
+                client.heartbeat("core")
+            self.assertEqual(caught.exception.code,"io_error")
+            self.assertEqual(Path(directory,"install.key").read_text(),"damaged")
 
     def test_watchdog_does_not_hold_guard_while_client_clock_blocks(self):
         release, entered = threading.Event(), threading.Event()
@@ -157,3 +164,29 @@ class MonitorTests(unittest.TestCase):
         finally:
             release.set()
             monitor.close()
+
+    def test_repeated_stalled_transport_keeps_only_one_network_worker(self):
+        release, entered = threading.Event(), threading.Event()
+        calls = 0
+        def blocked(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            release.wait(2)
+            raise OSError("synthetic transport shutdown")
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client("demo", {"test":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"},directory=directory)
+            client._http.open = blocked
+            try:
+                with self.assertRaises(LicenseboxError):
+                    client._post("/v1/renew", {}, timeout=0.02)
+                self.assertTrue(entered.is_set())
+                for _ in range(20):
+                    with self.assertRaises(LicenseboxError) as caught:
+                        client._post("/v1/renew", {}, timeout=0.02)
+                    self.assertEqual(caught.exception.code,"network_error")
+                self.assertEqual(calls,1)
+                self.assertFalse(client._pending_exchange.is_set())
+            finally:
+                release.set()
+                self.assertTrue(client._pending_exchange.wait(0.5))

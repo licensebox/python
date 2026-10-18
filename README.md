@@ -67,7 +67,7 @@ MIT. Copyright © 2026 [Vijai Kumar](https://meshing.engineer).
 ## Optional monitoring
 
 `heartbeat("export")` always attempts silent renewal within a three-second total
-network budget. It never activates, transfers a seat or creates a missing
+network budget. Repeated stalled calls retain at most one network-only worker per client; late replies cannot change saved access. It never activates, transfers a seat or creates a missing
 installation key. `online: false` means an eligible outage was covered by the
 unchanged, verified, unexpired offline lease. Explicit refusals never fall back.
 The server's optional signed `heartbeat` policy bounds the contact deadline.

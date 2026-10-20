@@ -26,6 +26,7 @@ import ssl
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA65PrivateKey, MLDSA65PublicKey
 
 _SOURCES = {"linux-dmi", "linux-device-tree", "linux-machine-id", "windows-smbios", "macos-platform"}
 _POLICY = {"seat_transferred", "location_denied", "location_unknown", "machine_changed"}
@@ -63,6 +64,68 @@ def _dec(value: str, length: int | None = None) -> bytes:
         return result
     except (ValueError, TypeError) as error:
         raise LicenseboxError("malformed", "invalid base64url value") from error
+
+
+# Protocol v3 signs everything with Ed25519 and ML-DSA-65 together; both must
+# verify. Keys are written "<alg>:<base64url>", Ed25519 part first.
+ALGORITHM = "ed25519-mldsa65"
+_PUBLIC, _SIGNATURE, _SEED = 32 + 1952, 64 + 3309, 32 + 32
+
+
+class _Key:
+    """A hybrid installation key, kept as its 64-byte seed."""
+
+    def __init__(self, seed: bytes):
+        self.seed = seed
+        self._ed = Ed25519PrivateKey.from_private_bytes(seed[:32])
+        self._ml = MLDSA65PrivateKey.from_seed_bytes(seed[32:])
+
+    @classmethod
+    def generate(cls) -> "_Key":
+        return cls(os.urandom(_SEED))
+
+    @classmethod
+    def decode(cls, text: str) -> "_Key":
+        algorithm, _, data = text.strip().partition(":")
+        if algorithm != ALGORITHM:
+            raise LicenseboxError("malformed", "unknown installation key algorithm")
+        return cls(_dec(data, _SEED))
+
+    def encode(self) -> str:
+        return ALGORITHM + ":" + _enc(self.seed)
+
+    def public(self) -> str:
+        return ALGORITHM + ":" + _enc(self._ed.public_key().public_bytes_raw() + self._ml.public_key().public_bytes_raw())
+
+    def sign(self, message: bytes) -> bytes:
+        # Pure Ed25519, and hedged ML-DSA-65 with an empty context.
+        return self._ed.sign(message) + self._ml.sign(message)
+
+
+def _public_key(text: str) -> tuple[Ed25519PublicKey, MLDSA65PublicKey]:
+    """Reads a trusted or installation public key; anything but a whole
+    ed25519-mldsa65 key is malformed, never read as Ed25519 alone."""
+    algorithm, _, data = text.partition(":") if isinstance(text, str) else ("", "", "")
+    if algorithm != ALGORITHM:
+        raise LicenseboxError("malformed", "unknown public key algorithm")
+    raw = _dec(data, _PUBLIC)
+    try:
+        return Ed25519PublicKey.from_public_bytes(raw[:32]), MLDSA65PublicKey.from_public_bytes(raw[32:])
+    except ValueError as error:
+        raise LicenseboxError("malformed", "invalid public key") from error
+
+
+def _verify(public: str, signature: bytes, message: bytes) -> bool:
+    """Both halves must verify. The algorithm is the trusted key's."""
+    ed, ml = _public_key(public)
+    if len(signature) != _SIGNATURE:
+        return False
+    try:
+        ed.verify(signature[:64], message)
+        ml.verify(signature[64:], message)
+        return True
+    except InvalidSignature:
+        return False
 
 
 def _binding_valid(value: str) -> bool:
@@ -159,24 +222,22 @@ def _parse(token: str) -> tuple[dict, bytes, bytes]:
         value = json.loads(data)
         if not isinstance(value, dict):
             raise ValueError()
-        return value, data, _dec(signature, 64)
+        return value, data, _dec(signature)
     except (ValueError, UnicodeError, TypeError) as error:
         raise LicenseboxError("malformed", "invalid lease token") from error
 
 
 def verify_lease(token: str, product: str, keys: Mapping[str, str], now: float, *, allow_expired: bool = False) -> dict:
     value, payload, signature = _parse(token)
-    if value.get("v") != 2:
+    if value.get("v") != 3:
         raise LicenseboxError("version", "unsupported lease version; update the application")
     if value.get("kid") not in keys:
         raise LicenseboxError("unknown_key")
-    try:
-        Ed25519PublicKey.from_public_bytes(_dec(keys[value["kid"]], 32)).verify(signature, b"licensebox lease v2\n" + payload)
-    except InvalidSignature as error:
-        raise LicenseboxError("bad_signature") from error
+    if not _verify(keys[value["kid"]], signature, f"licensebox lease v3\n{ALGORITHM}\n".encode() + payload):
+        raise LicenseboxError("bad_signature")
     if value.get("product") != product or not _binding_valid(value.get("binding", "")):
         raise LicenseboxError("malformed", "lease product or native binding does not match")
-    _dec(value.get("machine", ""), 32)
+    _public_key(value.get("machine", ""))
     if not isinstance(value.get("modules"), list) or any(not isinstance(item, str) for item in value["modules"]):
         raise LicenseboxError("malformed", "invalid module list")
     expires = _epoch(value.get("expires"))
@@ -206,7 +267,7 @@ class Client:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", product) or not keys:
             raise ValueError("a product ID and trusted public keys are required")
         for key in keys.values():
-            _dec(key, 32)
+            _public_key(key)
         url = urlsplit(server)
         if url.username or url.password or url.query or url.fragment or url.scheme != "https" and not (url.scheme == "http" and url.hostname in {"localhost", "127.0.0.1", "::1"}):
             raise ValueError("server must use HTTPS (HTTP is allowed only on loopback)")
@@ -267,13 +328,13 @@ class Client:
         self._write("seen", datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"))
         return now
 
-    def _key(self) -> Ed25519PrivateKey:
+    def _key(self) -> _Key:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         for _ in range(40):
             try:
                 seed = self._read("install.key")
                 if seed:
-                    return Ed25519PrivateKey.from_private_bytes(_dec(seed, 32))
+                    return _Key.decode(seed)
             except LicenseboxError:
                 pass
             try:
@@ -281,23 +342,23 @@ class Client:
             except FileExistsError:
                 time.sleep(0.025)
                 continue
-            key = Ed25519PrivateKey.generate()
+            key = _Key.generate()
             with os.fdopen(descriptor, "w") as output:
-                output.write(_enc(key.private_bytes_raw()) + "\n")
+                output.write(key.encode() + "\n")
             return key
         raise LicenseboxError("io_error", "installation key is damaged or being written by another process")
 
-    def _existing_key(self) -> Ed25519PrivateKey:
+    def _existing_key(self) -> _Key:
         seed = self._read("install.key")
         if not seed:
             raise LicenseboxError("not_signed_in", "the installation key is unavailable; explicitly sign in")
         try:
-            return Ed25519PrivateKey.from_private_bytes(_dec(seed, 32))
+            return _Key.decode(seed)
         except (LicenseboxError, ValueError) as error:
             raise LicenseboxError("io_error", "the installation key is damaged; explicitly sign in") from error
 
-    def _own(self, value: dict, key: Ed25519PrivateKey | None = None) -> None:
-        if value.get("binding") != self._binding() or value.get("machine") != _enc((key or self._key()).public_key().public_bytes_raw()):
+    def _own(self, value: dict, key: _Key | None = None) -> None:
+        if value.get("binding") != self._binding() or value.get("machine") != (key or self._key()).public():
             raise PolicyError("machine_changed", "these credentials belong to another machine; explicitly sign in to activate here")
 
     def _denial(self) -> None:
@@ -393,14 +454,14 @@ class Client:
             raise LicenseboxError(code, detail, status)
         return value
 
-    def _save(self, token: str, key: Ed25519PrivateKey | None = None) -> dict:
+    def _save(self, token: str, key: _Key | None = None) -> dict:
         value = verify_lease(token, self.product, self.keys, self._now())
         self._own(value, key)
         self._write("lease", token)
         self._remove("policy-denial")
         return value
 
-    def _call(self, kind: str, payload: dict, *, timeout: float = 20, key: Ed25519PrivateKey | None = None, cancel: threading.Event | None = None) -> dict | list:
+    def _call(self, kind: str, payload: dict, *, timeout: float = 20, key: _Key | None = None, cancel: threading.Event | None = None) -> dict | list:
         if kind not in _CALLS:
             raise ValueError("unknown signed operation")
         token = self._read("lease")
@@ -408,11 +469,11 @@ class Client:
         self._own(value, key)
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         at = _stamp(self.clock())
-        message = f"licensebox {kind} v2\n{token}\n{self._binding()}\n{at}\n{hashlib.sha256(body.encode()).hexdigest()}"
+        message = f"licensebox {kind} v3\n{ALGORITHM}\n{token}\n{self._binding()}\n{at}\n{hashlib.sha256(body.encode()).hexdigest()}"
         return self._post("/v1/" + kind, {"lease": token, "binding": self._binding(), "time": at,
                           "payload": body, "version": self.version, "signature": _enc((key or self._key()).sign(message.encode()))}, timeout, cancel)
 
-    def _renew(self, timeout: float = 3, *, key: Ed25519PrivateKey | None = None, cancel: threading.Event | None = None) -> dict:
+    def _renew(self, timeout: float = 3, *, key: _Key | None = None, cancel: threading.Event | None = None) -> dict:
         sent = self._usage()[:100]
         response = self._call("renew", {"usage": sent}, timeout=timeout, key=key, cancel=cancel)
         value = self._save(response["lease"], key)
@@ -531,9 +592,9 @@ class Client:
             self._rotate()
             rotated = True
         key, at = self._key(), _stamp(self.clock())
-        proof = f"licensebox device v2\n{self.product}\n{binding}\n{at}".encode()
+        proof = f"licensebox device v3\n{ALGORITHM}\n{self.product}\n{binding}\n{at}".encode()
         try:
-            device = self._post("/v1/device", {"product": self.product, "machine": _enc(key.public_key().public_bytes_raw()),
+            device = self._post("/v1/device", {"product": self.product, "machine": key.public(),
                     "binding": binding, "os": {"win32": "windows", "darwin": "darwin"}.get(sys.platform, "linux"),
                     "arch": {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine()),
                     "version": self.version, "time": at, "signature": _enc(key.sign(proof))})
@@ -561,7 +622,7 @@ class Client:
             at = _stamp(self.clock())
             try:
                 response = self._post("/v1/token", {"device_code": device["device_code"], "binding": binding, "time": at,
-                        "signature": _enc(key.sign(f"licensebox token v2\n{device['device_code']}\n{binding}\n{at}".encode()))}, min(20, max(0.01, deadline-time.monotonic())))
+                        "signature": _enc(key.sign(f"licensebox token v3\n{ALGORITHM}\n{device['device_code']}\n{binding}\n{at}".encode()))}, min(20, max(0.01, deadline-time.monotonic())))
                 value = self._save(response["lease"])
                 if old and old.get("user") != value.get("user"):
                     self._remove("usage.json")
@@ -584,7 +645,7 @@ class Client:
         raise LicenseboxError("sign_in_expired")
 
     def _rotate(self) -> None:
-        self._write("install.key", _enc(Ed25519PrivateKey.generate().private_bytes_raw()))
+        self._write("install.key", _Key.generate().encode())
         self._forget()
 
     def _forget(self) -> None:

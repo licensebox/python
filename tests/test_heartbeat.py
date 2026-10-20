@@ -8,8 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from licensebox import Client, HeartbeatMonitor, LicenseboxError
+from licensebox.client import _Key
+
+TEST_KEY = _Key(bytes(64)).public()  # synthetic trusted key
 
 
 def result(seconds=0.2, online=True):
@@ -34,7 +36,7 @@ class MonitorTests(unittest.TestCase):
 
     def test_no_implicit_threads_or_identity_creation(self):
         with tempfile.TemporaryDirectory() as directory:
-            client = Client("demo", {"test": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"}, directory=directory)
+            client = Client("demo", {"test": TEST_KEY}, directory=directory)
             before = set(threading.enumerate())
             with self.assertRaises(LicenseboxError) as caught:
                 client.heartbeat("core")
@@ -117,18 +119,18 @@ class MonitorTests(unittest.TestCase):
     def test_returned_heartbeat_cannot_mutate_cached_authorization(self):
         def enc(value):
             return base64.urlsafe_b64encode(value).decode().rstrip("=")
-        install = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-        signing = Ed25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
+        install = _Key(bytes(range(64)))
+        signing = _Key(bytes(range(64, 128)))
         now = time.time()
-        lease = {"v":2,"kid":"test","product":"demo","machine":enc(install.public_key().public_bytes_raw()),
+        lease = {"v":3,"kid":"test","product":"demo","machine":install.public(),
                  "binding":"m1:linux-dmi:"+"1"*64,"modules":["core"],"issued":datetime.fromtimestamp(now,timezone.utc).isoformat(),
                  "expires":datetime.fromtimestamp(now+60,timezone.utc).isoformat()}
         payload = json.dumps(lease).encode()
-        token = enc(payload)+"."+enc(signing.sign(b"licensebox lease v2\n"+payload))
+        token = enc(payload)+"."+enc(signing.sign(b"licensebox lease v3\ned25519-mldsa65\n"+payload))
         with tempfile.TemporaryDirectory() as directory:
-            Path(directory,"install.key").write_text(enc(install.private_bytes_raw()))
+            Path(directory,"install.key").write_text(install.encode())
             Path(directory,"lease").write_text(token)
-            client = Client("demo",{"test":enc(signing.public_key().public_bytes_raw())},directory=directory,
+            client = Client("demo",{"test":signing.public()},directory=directory,
                             clock=lambda:now,machine_binding=lambda:lease["binding"])
             client._post = Mock(return_value={"lease":token})
             response = client.heartbeat("core")
@@ -175,7 +177,7 @@ class MonitorTests(unittest.TestCase):
             release.wait(2)
             raise OSError("synthetic transport shutdown")
         with tempfile.TemporaryDirectory() as directory:
-            client = Client("demo", {"test":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"},directory=directory)
+            client = Client("demo", {"test":TEST_KEY},directory=directory)
             client._http.open = blocked
             try:
                 with self.assertRaises(LicenseboxError):
@@ -236,7 +238,7 @@ class MonitorTests(unittest.TestCase):
                     def read1(self,_):
                         if stalled: release.wait(1)
                         raise TimeoutError("synthetic body timeout")
-                client = Client("demo",{"test":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"},directory=directory)
+                client = Client("demo",{"test":TEST_KEY},directory=directory)
                 client._http.open = Mock(return_value=Refusal())
                 try:
                     with self.assertRaises(LicenseboxError) as caught:

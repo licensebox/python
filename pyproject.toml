@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "licensebox"
-version = "0.2.0"
+version = "0.3.0"
 description = "Machine-bound Licensebox licensing for desktop and command-line apps"
 requires-python = ">=3.10"
-dependencies = ["cryptography>=43"]
+dependencies = ["cryptography>=48"]
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Vijai Kumar"}]

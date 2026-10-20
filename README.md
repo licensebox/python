@@ -5,13 +5,17 @@ access for desktop and command-line applications. Licensebox manages licensing;
 product admins handle grants and any commercial arrangements separately.
 
 ```sh
-python3 -m pip install 'git+https://github.com/licensebox/python.git@v0.2.0'
+python3 -m pip install 'git+https://github.com/licensebox/python.git@v0.3.0'
 ```
 
 ```python
 from licensebox import Client, LicenseboxError
 
-lic = Client("myapp", {"myapp-k1": "YOUR_PUBLIC_VERIFICATION_KEY"}, version="1.0")
+# The product's public key, "ed25519-mldsa65:...", about 2.7 KB: keep it in a
+# module constant or a file rather than inline.
+MYAPP_KEY = "ed25519-mldsa65:YOUR_PUBLIC_VERIFICATION_KEY"
+
+lic = Client("myapp", {"myapp-k1": MYAPP_KEY}, version="1.0")
 try:
     lic.require("export")
 except LicenseboxError as error:
@@ -57,8 +61,10 @@ not hardware attestation. Cloned/spoofed IDs and modified host software remain
 limitations. Offline transfer/revocation changes become known at the next online
 check or lease expiry. Client construction and `require()` start no heartbeat scheduler.
 
-Python 3.10+, [cryptography](https://cryptography.io/en/46.0.4/hazmat/primitives/asymmetric/ed25519/)
-43+; no hand-written crypto. The admin CLI stays in [licensebox/go](https://github.com/licensebox/go).
+Speaks protocol v3: every signature is Ed25519 and ML-DSA-65 (FIPS 204)
+together, and both must verify. Python 3.10+ and
+[cryptography](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/mldsa/)
+48+, the first release with ML-DSA; no hand-written crypto. The admin CLI stays in [licensebox/go](https://github.com/licensebox/go).
 See [protocol and conformance](https://github.com/licensebox/protocol) and
 [Licensebox docs](https://licensebox.dev/docs).
 

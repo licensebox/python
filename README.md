@@ -45,11 +45,14 @@ platform/test integration seams, never end-user configuration knobs.
 | `request_access(["export"], "why")`, `requests()` | request admin approval and read answers |
 | `access_link()` | short-lived private browser access link |
 | `record("export", success, elapsed_seconds)` | count fixed command names when enabled |
+| `checkout(module)`, `checkin(*modules)` | take and return a floating copy |
+| `enrol(token)` | sign a service account's machine in with a one-time token |
 
 Catch `PolicyError` for `machine_changed`, `seat_transferred`, `location_denied`
 and `location_unknown`. `ModuleError` identifies missing access. Other
 `LicenseboxError.code` values include `offline`, `revoked`, `denied`,
-`sign_in_expired`, `expired`, `identity_unavailable`. Display errors and stop
+`sign_in_expired`, `expired`, `identity_unavailable`, `no_free_copy` and
+`invalid_token`. Display errors and stop
 protected work. Explicit refusals persist and are never bypassed offline.
 
 ## Platform and security
@@ -100,3 +103,23 @@ up to 3.2 seconds for its worker. The context manager calls `close()`. A caller
 cancellation event stops scheduling and cancels in-flight network waits. No
 monitor starts implicitly. A Python watchdog requires normal thread scheduling;
 work that monopolizes the interpreter must cooperate with cancellation.
+
+## Seats per module, floating copies and service accounts
+
+A module can have seats of its own. It is in a machine's lease only while that
+machine holds one of its seats; elsewhere the lease names it in `elsewhere`,
+and `ModuleError.elsewhere` is set: an explicit `sign_in()` moves the seat here.
+
+A customer can hold a pool of floating copies of a module; the lease names
+such modules in `floating`. `require(module)` checks a copy out when the module
+is not held outright, and raises `LicenseboxError` with code `no_free_copy`
+when every copy is in use. Keep the copy with `heartbeat` or `watch` while the
+work runs, and return it with `checkin(module)`. A copy lives only as long as
+the lease, so a crashed application frees its copy when the heartbeat grace
+passes; a heartbeat takes a lapsed copy again if one is free.
+
+A server or build runner can be licensed as a service account. Set the
+one-time token an admin issued as `LICENSEBOX_ENROL_TOKEN`, or pass
+`Client(..., enrol_token=...)`: the first `require`, `lease` or `sign_in`
+enrols the machine without a browser. A used or expired token raises code
+`invalid_token`.

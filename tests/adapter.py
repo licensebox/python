@@ -19,6 +19,8 @@ try:
             options["machine_binding"] = lambda: request["binding"]
         options["clock"] = lambda: request["now"]
         options["on_sign_in"] = lambda *_: None
+        if "enrol_token" in request:
+            options["enrol_token"] = request["enrol_token"]
         client = Client(**options, version="conformance")
         if operation == "lease":
             result = client.lease()
@@ -33,6 +35,12 @@ try:
             if operation == "heartbeat-repeat":
                 client.heartbeat(module)
             result = client.heartbeat(module)
+        elif operation == "enrol":
+            result = client.enrol(request["token"])
+        elif operation == "checkout":
+            result = client.checkout(request["module"])
+        elif operation == "checkin":
+            result = client.checkin(request["module"])
         elif operation == "status":
             result = client.status()
         elif operation == "sign_in":

@@ -30,7 +30,9 @@ from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA65PrivateKey, M
 
 _SOURCES = {"linux-dmi", "linux-device-tree", "linux-machine-id", "windows-smbios", "macos-platform"}
 _POLICY = {"seat_transferred", "location_denied", "location_unknown", "machine_changed"}
-_CALLS = {"renew", "modules", "request", "requests", "access-link"}
+_CALLS = {"renew", "modules", "request", "requests", "access-link", "checkout", "checkin"}
+# A service account's one-time enrolment token is read from here when none is configured.
+TOKEN_ENV = "LICENSEBOX_ENROL_TOKEN"
 _LIMIT = 1 << 20
 
 
@@ -45,9 +47,26 @@ class PolicyError(LicenseboxError):
 
 
 class ModuleError(LicenseboxError):
-    def __init__(self, product: str, module: str, email: str):
-        self.product, self.module, self.email = product, module, email
-        super().__init__("module_denied", f"{product}: {module} is not licensed to {email}")
+    """A module the lease leaves out. ``elsewhere`` is set when the user holds
+    it but its seat, counted apart from the product's, is on another machine:
+    an explicit sign-in here moves it."""
+    def __init__(self, product: str, module: str, email: str, elsewhere: bool = False):
+        self.product, self.module, self.email, self.elsewhere = product, module, email, elsewhere
+        if elsewhere:
+            detail = f"{product}: the seat of {module} is on another machine; explicitly sign in to move it here"
+        else:
+            detail = f"{product}: {module} is not licensed to {email or 'this account'}"
+        super().__init__("module_denied", detail)
+
+
+def _has(value: dict, module: str) -> bool:
+    """The lease lets its holder run the module: one of its modules, or a
+    floating copy this machine has checked out."""
+    return module in value["modules"] or module in value.get("checkouts", [])
+
+
+def _module_error(product: str, module: str, value: dict) -> ModuleError:
+    return ModuleError(product, module, value.get("email", ""), module in value.get("elsewhere", []))
 
 
 def _enc(data: bytes) -> str:
@@ -240,6 +259,10 @@ def verify_lease(token: str, product: str, keys: Mapping[str, str], now: float, 
     _public_key(value.get("machine", ""))
     if not isinstance(value.get("modules"), list) or any(not isinstance(item, str) for item in value["modules"]):
         raise LicenseboxError("malformed", "invalid module list")
+    for field in ("elsewhere", "floating", "checkouts"):
+        listed = value.get(field, [])
+        if not isinstance(listed, list) or any(not isinstance(item, str) for item in listed):
+            raise LicenseboxError("malformed", "invalid " + field + " list")
     expires = _epoch(value.get("expires"))
     heartbeat = value.get("heartbeat")
     if heartbeat is not None:
@@ -263,7 +286,7 @@ class Client:
     def __init__(self, product: str, keys: Mapping[str, str], *, version: str = "", server: str = "https://licensebox.dev",
                  directory: str | Path | None = None, on_sign_in: Callable[[str, str], None] | None = None,
                  machine_binding: Callable[[], str] | None = None, clock: Callable[[], float] = time.time,
-                 ca_bundle: str | Path | None = None):
+                 ca_bundle: str | Path | None = None, enrol_token: str | None = None):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", product) or not keys:
             raise ValueError("a product ID and trusted public keys are required")
         for key in keys.values():
@@ -279,6 +302,7 @@ class Client:
         self.product, self.keys, self.version, self.server = product, dict(keys), version, server.rstrip("/")
         self.directory, self.on_sign_in, self.clock = Path(directory), on_sign_in, clock
         self._binding_provider = machine_binding or (lambda: native_binding(product))
+        self.enrol_token = enrol_token
         self._host: str | None = None
         self._checked: dict | None = None
         self._lock = threading.RLock()
@@ -514,7 +538,7 @@ class Client:
     def require(self, module: str) -> dict:
         with self._lock:
             value = self.lease()
-            if module not in value["modules"] and self._checked is None:
+            if not _has(value, module) and self._checked is None:
                 try:
                     value = self._checked = self._renew()
                 except PolicyError:
@@ -522,8 +546,10 @@ class Client:
                 except LicenseboxError as error:
                     if error.code != "network_error" and error.status < 500:
                         raise
-            if module not in value["modules"]:
-                raise ModuleError(self.product, module, value.get("email", ""))
+            if not _has(value, module) and module in value.get("floating", []):
+                return copy.deepcopy(self._checkout(module))
+            if not _has(value, module):
+                raise _module_error(self.product, module, value)
             return copy.deepcopy(value)
 
     def heartbeat(self, module: str, *, cancel: threading.Event | None = None) -> dict:
@@ -553,8 +579,12 @@ class Client:
                     raise LicenseboxError("offline", "the offline lease expired; connect to the internet") from error
                 value, online = kept, False
             self._checked = value
-            if module not in value["modules"]:
-                raise ModuleError(self.product, module, value.get("email", ""))
+            if online and not _has(value, module) and module in value.get("floating", []) and module in kept.get("checkouts", []):
+                # The copy lapsed, as after a gap longer than the grace, or an
+                # admin freed it: it is taken again if one is free.
+                value = self._checkout(module, key)
+            if not _has(value, module):
+                raise _module_error(self.product, module, value)
             return {"lease": copy.deepcopy(value), "online": online}
 
     def watch(self, module: str, *, interval: float | None = None,
@@ -579,7 +609,79 @@ class Client:
         with self._lock:
             return self._sign_in(True, timeout, cancel)
 
+    def _token(self) -> str:
+        return (self.enrol_token or os.environ.get(TOKEN_ENV, "")).strip()
+
+    def enrol(self, token: str) -> dict:
+        """Sign this machine in as a service account with a one-time token an
+        admin issued, without a person or a browser. The token is spent."""
+        with self._lock:
+            return self._enrol(token)
+
+    def _enrol(self, token: str) -> dict:
+        token = token.strip() if isinstance(token, str) else ""
+        if not token:
+            raise LicenseboxError("invalid_token", "an enrolment token is required")
+        binding = self._binding()
+        try:
+            old, _, _ = _parse(self._read("lease"))
+            if _binding_valid(old.get("binding", "")) and old["binding"] != binding:
+                self._rotate()
+        except LicenseboxError:
+            pass
+        key, at = self._key(), _stamp(self.clock())
+        secret = hashlib.sha256(token.encode()).hexdigest()
+        proof = f"licensebox enrol v3\n{ALGORITHM}\n{self.product}\n{secret}\n{binding}\n{at}".encode()
+        try:
+            response = self._post("/v1/enrol", {"product": self.product, "token": token, "machine": key.public(),
+                    "binding": binding, "os": {"win32": "windows", "darwin": "darwin"}.get(sys.platform, "linux"),
+                    "arch": {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine()),
+                    "version": self.version, "time": at, "signature": _enc(key.sign(proof))})
+        except LicenseboxError as error:
+            if error.code == "access_denied":
+                raise LicenseboxError("denied", error.detail, error.status) from error
+            raise
+        value = self._save(response["lease"], key)
+        self._usage_sent([], response.get("usage", False))
+        self._checked = value
+        return dict(value)
+
+    def checkout(self, module: str) -> dict:
+        """Check a floating copy of the module out for this machine. Raises
+        no_free_copy when every copy is in use, or ModuleError when the module
+        is not the user's to check out. Keep it with heartbeats; check it in."""
+        with self._lock:
+            self.lease()
+            return copy.deepcopy(self._checkout(module))
+
+    def _checkout(self, module: str, key: _Key | None = None) -> dict:
+        try:
+            value = self._lease_call("checkout", {"module": module}, key)
+        except LicenseboxError as error:
+            if error.code == "not_floating":
+                kept, _, _ = _parse(self._read("lease"))
+                raise ModuleError(self.product, module, kept.get("email", "")) from error
+            raise
+        if not _has(value, module):
+            raise _module_error(self.product, module, value)
+        return value
+
+    def checkin(self, *modules: str) -> None:
+        """Return this machine's floating copies of the modules, or all of
+        them with none named, to the pool."""
+        with self._lock:
+            self._lease_call("checkin", {"modules": list(modules)})
+
+    def _lease_call(self, kind: str, payload: dict, key: _Key | None = None) -> dict:
+        if not self._read("lease"):
+            raise LicenseboxError("not_signed_in")
+        response = self._call(kind, payload, key=key)
+        value = self._checked = self._save(response["lease"], key)
+        return value
+
     def _sign_in(self, explicit: bool, timeout: float | None = None, cancel: threading.Event | None = None, rotated: bool = False) -> dict:
+        if token := self._token():
+            return self._enrol(token)
         binding = self._binding()
         old = None
         try:
